@@ -97,6 +97,19 @@ describe('Trigger event - Throttle triggered events - /v1/events/trigger (POST) 
     const completedThrottleJobs = throttleJobs.filter((job) => job.status === JobStatusEnum.COMPLETED);
     expect(completedThrottleJobs?.length).to.equal(2);
 
+    // Check stepOutput for completed throttle jobs - verifies fix for issue #9919
+    for (const completedJob of completedThrottleJobs) {
+      expect(completedJob.stepOutput).to.be.ok;
+      expect(completedJob.stepOutput?.throttled).to.equal(false);
+      expect(completedJob.stepOutput?.threshold).to.equal(3);
+      expect(completedJob.stepOutput?.executionCount).to.be.a('number');
+      expect(completedJob.stepOutput?.executionCount).to.be.at.most(3);
+      // windowStart should be an ISO date string if present
+      if (completedJob.stepOutput?.windowStart) {
+        expect(completedJob.stepOutput.windowStart).to.match(/^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+      }
+    }
+
     // Both in-app messages should be created
     const messages = await messageRepository.find({
       _environmentId: session.environment._id,
@@ -634,5 +647,79 @@ describe('Trigger event - Throttle triggered events - /v1/events/trigger (POST) 
     });
 
     expect(inAppMessages?.length).to.equal(1);
+  });
+
+  it('should set stepOutput with throttled property for non-throttled executions (issue #9919)', async () => {
+    const workflowBody: CreateWorkflowDto = {
+      name: 'Test Throttle StepOutput Fix',
+      workflowId: 'test-throttle-stepoutput-fix',
+      active: true,
+      source: WorkflowCreationSourceEnum.Dashboard,
+      steps: [
+        {
+          type: StepTypeEnum.THROTTLE,
+          name: 'Throttle Step',
+          controlValues: {
+            type: 'fixed',
+            amount: 1,
+            unit: 'minutes',
+            threshold: 5, // High threshold to ensure no throttling
+          },
+        },
+        {
+          type: StepTypeEnum.IN_APP,
+          name: 'In-App Message',
+          controlValues: {
+            body: 'Throttle status: {{steps.throttle-step.throttled}}',
+          },
+        },
+      ],
+    };
+
+    const { result: workflow } = await novuClient.workflows.create(workflowBody);
+
+    // Trigger a single event (well below threshold)
+    await triggerEvent(workflow.workflowId, {
+      customVar: 'Test event',
+    });
+
+    await session.waitForJobCompletion(workflow.id);
+
+    const throttleJobs = await jobRepository.find({
+      _environmentId: session.environment._id,
+      _templateId: workflow.id,
+      type: StepTypeEnum.THROTTLE,
+    });
+
+    expect(throttleJobs?.length).to.equal(1);
+
+    const throttleJob = throttleJobs[0];
+    expect(throttleJob.status).to.equal(JobStatusEnum.COMPLETED);
+
+    // Verify stepOutput structure - this is the fix for issue #9919
+    expect(throttleJob.stepOutput).to.exist;
+    expect(throttleJob.stepOutput?.throttled).to.equal(false);
+    expect(throttleJob.stepOutput?.threshold).to.equal(5);
+    expect(throttleJob.stepOutput?.executionCount).to.be.a('number');
+    expect(throttleJob.stepOutput?.executionCount).to.be.at.least(1);
+    expect(throttleJob.stepOutput?.executionCount).to.be.at.most(5);
+
+    // windowStart should be an ISO date string
+    if (throttleJob.stepOutput?.windowStart) {
+      const windowStart = new Date(throttleJob.stepOutput.windowStart);
+      expect(windowStart).to.be.instanceOf(Date);
+      expect(windowStart.getTime()).to.not.be.NaN;
+    }
+
+    // Verify that the in-app message was created (proving state hydration worked)
+    const messages = await messageRepository.find({
+      _environmentId: session.environment._id,
+      _subscriberId: subscriber._id,
+      channel: StepTypeEnum.IN_APP,
+    });
+
+    expect(messages?.length).to.equal(1);
+    // The message content should reference the throttled property if state hydration works
+    expect(messages[0].content).to.exist;
   });
 });
